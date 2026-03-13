@@ -1,0 +1,3 @@
+# Docksmith dependencies
+# Core Python stdlib used: pathlib, json, hashlib, tarfile, tempfile, subprocess
+# No external dependencies required for basic functionality
