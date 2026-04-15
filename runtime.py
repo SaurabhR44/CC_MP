@@ -11,12 +11,12 @@ Implements:
 import os
 import sys
 import tempfile
-import tarfile
 from pathlib import Path
-from typing import Optional, List
+from typing import Optional, List, Dict
 
 from manifest import Manifest
 from isolation import isolate_and_exec
+from tar_utils import extract_layers
 
 
 class ContainerRuntime:
@@ -27,7 +27,7 @@ class ContainerRuntime:
         self.manifest = manifest
         self.layers_dir = docksmith_home / "layers"
     
-    def run(self, cmd_override: Optional[List[str]] = None) -> int:
+    def run(self, cmd_override: Optional[List[str]] = None, extra_env: Dict[str, str] = None) -> int:
         """
         Run container.
         
@@ -40,50 +40,43 @@ class ContainerRuntime:
         """
         
         # Create temporary container root
-        with tempfile.TemporaryDirectory() as container_root:
-            container_root = Path(container_root)
+        with tempfile.TemporaryDirectory() as container_root_tmp:
+            container_root = Path(container_root_tmp)
             
             # Extract layers in order
-            for layer in self.manifest.layers:
-                self._extract_layer(layer.digest, container_root)
+            layer_paths = [self.layers_dir / L.digest.replace(':', '_') for L in self.manifest.layers]
+            extract_layers(layer_paths, container_root)
             
             # Determine command to execute
             if cmd_override:
                 cmd = cmd_override
+            elif self.manifest.config.Cmd:
+                cmd = self.manifest.config.Cmd
             else:
-                cmd = self.manifest.config.Cmd or ["/bin/sh"]
+                raise RuntimeError("No command specified and no CMD in image")
             
-            # Convert env vars list to dict
+            # Environment variables
             env_dict = {}
+            # Base env from manifest
             for var in self.manifest.config.Env:
                 if "=" in var:
                     key, value = var.split("=", 1)
                     env_dict[key] = value
             
+            # Extra env from CLI (-e)
+            if extra_env:
+                env_dict.update(extra_env)
+            
             # Execute container
-            return isolate_and_exec(
+            # runtime.run usually doesn't need to capture output (it's interactive)
+            # but we return the exit code.
+            exit_code, _, _ = isolate_and_exec(
                 container_root,
                 self.manifest.config.WorkingDir,
                 env_dict,
                 cmd,
+                capture_output=False
             )
-    
-    def _extract_layer(self, digest: str, container_root: Path) -> None:
-        """Extract layer TAR archive into container root."""
-        layer_path = self.layers_dir / digest
-        
-        if not layer_path.exists():
-            raise RuntimeError(f"Layer {digest} not found")
-        
-        # Handle empty TAR (from placeholder layers)
-        if layer_path.stat().st_size == 0:
-            return
-        
-        try:
-            with tarfile.open(layer_path, 'r') as tar:
-                tar.extractall(path=container_root, filter='data')
-        except tarfile.ReadError:
-            # Empty or malformed tar
-            pass
-        except tarfile.TarError as e:
-            raise RuntimeError(f"Failed to extract layer {digest}: {e}")
+            
+            return exit_code
+

@@ -12,13 +12,14 @@ Implements:
 import sys
 import os
 import argparse
+import time
 from pathlib import Path
 
-# Import submodules (to be created)
 from manifest import Image, Manifest
 from parser import DocksmithfileParser
 from builder import BuildEngine
 from runtime import ContainerRuntime
+from tar_utils import create_deterministic_tar
 
 
 DOCKSMITH_HOME = Path.home() / ".docksmith"
@@ -52,10 +53,12 @@ def cmd_build(args):
     instructions = parser.parse()
     
     # Execute build
-    builder = BuildEngine(DOCKSMITH_HOME, context_path)
-    image = builder.build(image_tag, instructions)
-    
-    print(f"Successfully built image: {image_tag}")
+    builder = BuildEngine(DOCKSMITH_HOME, context_path, no_cache=args.no_cache)
+    try:
+        builder.build(image_tag, instructions)
+    except Exception as e:
+        print(f"Build failed: {e}", file=sys.stderr)
+        sys.exit(1)
 
 
 def cmd_images(args):
@@ -63,19 +66,21 @@ def cmd_images(args):
     setup_docksmith_home()
     
     images_dir = DOCKSMITH_HOME / "images"
-    if not images_dir.exists() or not list(images_dir.glob("*.json")):
-        print("No images found")
+    manifests = sorted(images_dir.glob("*.json"))
+    
+    if not manifests:
+        print("REPOSITORY          TAG                 IMAGE ID            CREATED")
         return
     
-    print("REPOSITORY    TAG        DIGEST")
-    print("-" * 70)
+    print(f"{'REPOSITORY':20} {'TAG':20} {'IMAGE ID':20} {'CREATED':20}")
     
-    for manifest_file in sorted(images_dir.glob("*.json")):
-        manifest = Manifest.load(manifest_file)
-        name = manifest.name
-        tag = manifest.tag
-        digest = manifest.digest[:19] + "..."  # Shorten for display
-        print(f"{name:20} {tag:15} {digest}")
+    for manifest_file in manifests:
+        try:
+            manifest = Manifest.load(manifest_file)
+            image_id = manifest.digest[7:19] # Trim 'sha256:' and take 12 chars
+            print(f"{manifest.name:20} {manifest.tag:20} {image_id:20} {manifest.created:20}")
+        except Exception:
+            continue
 
 
 def cmd_run(args):
@@ -85,9 +90,20 @@ def cmd_run(args):
     image_tag = args.tag
     cmd_override = args.cmd  # Optional command override
     
+    # Parse env overrides
+    extra_env = {}
+    if args.env:
+        for item in args.env:
+            if "=" in item:
+                k, v = item.split("=", 1)
+                extra_env[k] = v
+            else:
+                print(f"Warning: invalid env format '{item}', expected KEY=VALUE")
+
     # Find image manifest
     images_dir = DOCKSMITH_HOME / "images"
-    manifest_file = images_dir / f"{image_tag}.json"
+    safe_image_tag = image_tag.replace(":", "_")
+    manifest_file = images_dir / f"{safe_image_tag}.json"
     
     if not manifest_file.exists():
         print(f"Error: image '{image_tag}' not found", file=sys.stderr)
@@ -97,9 +113,12 @@ def cmd_run(args):
     
     # Execute container
     runtime = ContainerRuntime(DOCKSMITH_HOME, manifest)
-    exit_code = runtime.run(cmd_override)
-    
-    sys.exit(exit_code)
+    try:
+        exit_code = runtime.run(cmd_override, extra_env=extra_env)
+        sys.exit(exit_code)
+    except Exception as e:
+        print(f"Run failed: {e}", file=sys.stderr)
+        sys.exit(1)
 
 
 def cmd_rmi(args):
@@ -108,7 +127,8 @@ def cmd_rmi(args):
     
     image_tag = args.tag
     images_dir = DOCKSMITH_HOME / "images"
-    manifest_file = images_dir / f"{image_tag}.json"
+    safe_image_tag = image_tag.replace(":", "_")
+    manifest_file = images_dir / f"{safe_image_tag}.json"
     
     if not manifest_file.exists():
         print(f"Error: image '{image_tag}' not found", file=sys.stderr)
@@ -116,11 +136,62 @@ def cmd_rmi(args):
     
     manifest = Manifest.load(manifest_file)
     
+    # Delete associated layers (spec: no reference counting, just delete them)
+    for layer in manifest.layers:
+        layer_file = DOCKSMITH_HOME / "layers" / layer.digest.replace(":", "_")
+        if layer_file.exists():
+            layer_file.unlink()
+            
     # Delete manifest
     manifest_file.unlink()
+    print(f"Deleted: {image_tag}")
+
+
+def cmd_import_base(args):
+    """docksmith import-base <name:tag> <tarball_path>"""
+    setup_docksmith_home()
     
-    # TODO: Delete associated layers if no other image uses them
-    print(f"Deleted image: {image_tag}")
+    import tempfile
+    import shutil
+    from manifest import Config
+    
+    image_tag = args.tag
+    tar_path = Path(args.path).resolve()
+    
+    if ":" in image_tag:
+        name, tag = image_tag.split(":", 1)
+    else:
+        name, tag = image_tag, "latest"
+        
+    if not tar_path.exists():
+        print(f"Error: tarball '{tar_path}' not found", file=sys.stderr)
+        sys.exit(1)
+
+    print(f"Importing base image {image_tag} from {tar_path}...")
+    
+    # We need to compute the digest of the tarball to make it a layer
+    tar_bytes = tar_path.read_bytes()
+    import hashlib
+    digest = hashlib.sha256(tar_bytes).hexdigest()
+    digest_full = f"sha256:{digest}"
+    
+    # Save layer
+    layer_file = DOCKSMITH_HOME / "layers" / digest_full.replace(":", "_")
+    layer_file.write_bytes(tar_bytes)
+    
+    # Create manifest
+    manifest = Manifest(
+        name=name,
+        tag=tag,
+        created=datetime.utcnow().isoformat() + "Z",
+        config=Config(Env=[], Cmd=["/bin/sh"], WorkingDir="/"),
+        layers=[Layer(digest=digest_full, size=len(tar_bytes), createdBy="import")],
+    )
+    manifest.digest = manifest.compute_digest()
+    
+    safe_tag = image_tag.replace(":", "_")
+    manifest.save(DOCKSMITH_HOME / "images" / f"{safe_tag}.json")
+    print(f"Successfully imported {image_tag} ({digest_full[:19]}...)")
 
 
 def main():
@@ -134,6 +205,7 @@ def main():
     # docksmith build
     build_parser = subparsers.add_parser("build", help="build an image")
     build_parser.add_argument("-t", "--tag", required=True, help="tag (name:tag)")
+    build_parser.add_argument("--no-cache", action="store_true", help="skip cache")
     build_parser.add_argument("context", help="build context directory")
     build_parser.set_defaults(func=cmd_build)
     
@@ -145,12 +217,19 @@ def main():
     run_parser = subparsers.add_parser("run", help="run a container")
     run_parser.add_argument("tag", help="image tag (name:tag)")
     run_parser.add_argument("cmd", nargs="*", help="command to run (optional)", default=None)
+    run_parser.add_argument("-e", "--env", action="append", help="environment variable (KEY=VALUE)")
     run_parser.set_defaults(func=cmd_run)
     
     # docksmith rmi
     rmi_parser = subparsers.add_parser("rmi", help="remove an image")
     rmi_parser.add_argument("tag", help="image tag (name:tag)")
     rmi_parser.set_defaults(func=cmd_rmi)
+    
+    # docksmith import-base
+    import_parser = subparsers.add_parser("import-base", help="import a base image tarball")
+    import_parser.add_argument("tag", help="tag (name:tag)")
+    import_parser.add_argument("path", help="path to tarball")
+    import_parser.set_defaults(func=cmd_import_base)
     
     args = parser.parse_args()
     
@@ -162,4 +241,7 @@ def main():
 
 
 if __name__ == "__main__":
+    from datetime import datetime
+    from manifest import Layer
     main()
+
